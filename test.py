@@ -23,7 +23,7 @@
     # net = Net()
     # net.load_state_dict(torch.load("/workspace/mnist.pth"))
     # net.eval()
-    #
+    #666
     # # ===== 3. 加载图片 =====
     # img_path = "/workspace/test.png"
     #

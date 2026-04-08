@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-    # import numpy as np
+# import numpy as np
     # import torch
     # import torch.nn as nn
     # import time
@@ -106,6 +106,7 @@
     #     plt.show()
     # except:
     #     print("未安装matplotlib，跳过可视化")
+    #66666666
 import numpy as np
 import torch
 import torch.nn as nn

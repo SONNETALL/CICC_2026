@@ -1,0 +1,13 @@
+# MNIST data files (too large for GitHub)
+data/mnist_train.csv
+data/mnist_test.csv
+
+# Python virtual environment
+.venv/
+
+# Model checkpoints
+ckpt/
+
+# Other large files
+*.pth
+*.npy

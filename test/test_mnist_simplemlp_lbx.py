@@ -1,28 +1,20 @@
-"""Evaluate BNN binary-state checkpoint with optical matmul on MNIST test split.
+"""Evaluate simple MLP (lbx) with optical matmul on MNIST test split.
 
-该脚本参照 test_mnist_cnn.py 的评测流程实现，针对 BNN 的
-best_mnist_bnn_binary_state.pt 做推理测试，并增加计时统计。
+该脚本参照 test_mnist_bnn_binary_state.py 的流程实现，
+针对 models/mnist_mlp_lbx 下的 simplemlp 权重做推理评测，包含：
+1) MNIST 测试集推理（支持 10k，全量前先跑 1k）
+2) 使用官方 op_computation_analysis 计算光计算占比
+3) 输出准确率、光计算占比、计时统计与总耗时
 
-光学加速映射策略：
-1) stem conv 保留 torch 侧执行
-2) block1 conv / block2 conv 通过 im2col + 光学矩阵乘法执行
-3) fc1 / fc2 通过光学矩阵乘法执行
-
-输出指标包括：
-- top1 accuracy（MNIST 10k 测试集）
-- optical compute ratio（光学卸载 MAC 占比）
-- 计时指标（总耗时、前向耗时、光学调用耗时、吞吐）
-
-Usage examples:
-    python test/test_mnist_bnn_binary_state.py
-    python test/test_mnist_bnn_binary_state.py --batch-size 512
-    python test/test_mnist_bnn_binary_state.py --optical-layers block1,block2
-    python test/test_mnist_bnn_binary_state.py --input-type int4 --act-clip-max 4.0
+默认行为：
+- 读取权重: models/mnist_mlp_lbx/w1.npy, w2.npy
+- 默认评测样本: 1000（可改为 10000）
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -36,7 +28,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 
-# 让测试脚本可以直接复用 src 下官方 MAC 统计实现。
+# 让测试脚本可以复用 src 下官方 MAC 统计实现。
 SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -45,7 +37,7 @@ from op_computation_analysis import calculate_linear_macs
 
 
 def parse_bool_flag(value: str) -> bool:
-    """将字符串参数解析为布尔值。"""
+    """将命令行字符串解析为布尔值。"""
     normalized = value.strip().lower()
     if normalized in {"1", "true", "yes", "y"}:
         return True
@@ -56,12 +48,24 @@ def parse_bool_flag(value: str) -> bool:
 
 def parse_args() -> argparse.Namespace:
     """定义命令行参数。"""
-    parser = argparse.ArgumentParser(description="Evaluate MNIST BNN binary-state checkpoint")
+    parser = argparse.ArgumentParser(description="Evaluate simplemlp lbx on MNIST test set")
     parser.add_argument(
-        "--checkpoint",
+        "--weights-dir",
         type=str,
-        default="models/mnist_bnn/best_mnist_bnn_binary_state.pt",
-        help="Path to BNN binary-state checkpoint (relative to project root or absolute path).",
+        default="models/mnist_mlp_lbx",
+        help="Directory containing w1.npy and w2.npy.",
+    )
+    parser.add_argument(
+        "--w1-file",
+        type=str,
+        default="w1.npy",
+        help="Filename of first layer weight matrix under weights-dir.",
+    )
+    parser.add_argument(
+        "--w2-file",
+        type=str,
+        default="w2.npy",
+        help="Filename of second layer weight matrix under weights-dir.",
     )
     parser.add_argument(
         "--data-root",
@@ -72,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=256,
+        default=512,
         help="Batch size used for evaluation.",
     )
     parser.add_argument(
@@ -113,11 +117,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--optical-layers",
         type=str,
-        default="block1,block2",
+        default="fc1,fc2",
         help=(
             "Comma-separated layers offloaded to optical simulator. "
-            "Valid names: block1,block2,fc1,fc2. "
-            "Example: --optical-layers block1,block2"
+            "Valid names: fc1,fc2. Example: --optical-layers fc1"
         ),
     )
     parser.add_argument(
@@ -126,7 +129,7 @@ def parse_args() -> argparse.Namespace:
         default=1_000,
         help=(
             "Maximum number of test samples to evaluate. "
-            "Use a smaller value (e.g. 1000) for quick timing runs."
+            "Set to 10000 for full MNIST test split evaluation."
         ),
     )
     return parser.parse_args()
@@ -134,7 +137,7 @@ def parse_args() -> argparse.Namespace:
 
 def parse_optical_layers(raw: str) -> set[str]:
     """解析并校验光学卸载层列表。"""
-    valid = {"block1", "block2", "fc1", "fc2"}
+    valid = {"fc1", "fc2"}
     items = {item.strip().lower() for item in raw.split(",") if item.strip()}
 
     invalid = sorted(items - valid)
@@ -144,6 +147,14 @@ def parse_optical_layers(raw: str) -> set[str]:
             f"{invalid}. Valid names are: {sorted(valid)}"
         )
     return items
+
+
+def resolve_path(project_root: Path, user_path: str) -> Path:
+    """Resolve user path to an absolute path using project root fallback."""
+    path = Path(user_path)
+    if path.is_absolute():
+        return path
+    return (project_root / path).resolve()
 
 
 def select_device(device_arg: str) -> torch.device:
@@ -157,103 +168,63 @@ def select_device(device_arg: str) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def binary_sign_inference(x: torch.Tensor) -> torch.Tensor:
-    """推理阶段二值化：x>=0 映射 +1，否则 -1。"""
-    return torch.where(x >= 0, torch.ones_like(x), -torch.ones_like(x))
-
-
-class BinaryConv2d(nn.Conv2d):
-    """二值卷积层（推理版）。"""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        binary_weight = binary_sign_inference(self.weight)
-        return F.conv2d(
-            x,
-            binary_weight,
-            self.bias,
-            self.stride,
-            self.padding,
-            self.dilation,
-            self.groups,
-        )
-
-
-class BinaryLinear(nn.Linear):
-    """二值全连接层（推理版）。"""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        binary_weight = binary_sign_inference(self.weight)
-        return F.linear(x, binary_weight, self.bias)
-
-
-class MNISTBNN(nn.Module):
-    """与训练脚本一致的 BNN 结构定义。"""
+class SimpleMLP(nn.Module):
+    """Simple MLP for MNIST: 784 -> 64 -> 10 (no bias)."""
 
     def __init__(self) -> None:
         super().__init__()
-
-        self.stem = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.Hardtanh(inplace=True),
-        )
-
-        self.block1 = nn.Sequential(
-            BinaryConv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.MaxPool2d(kernel_size=2),
-        )
-
-        self.block2 = nn.Sequential(
-            BinaryConv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.MaxPool2d(kernel_size=2),
-        )
-
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            BinaryLinear(64 * 7 * 7, 256, bias=False),
-            nn.BatchNorm1d(256),
-            nn.Dropout(p=0.2),
-            nn.Linear(256, 10),
-        )
+        self.fc1 = nn.Linear(784, 64, bias=False)
+        self.fc2 = nn.Linear(64, 10, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)
-        x = binary_sign_inference(x)
+        x = torch.flatten(x, start_dim=1)
+        x = self.fc1(x)
+        x = F.relu(x, inplace=False)
+        x = self.fc2(x)
+        return x
 
-        x = self.block1(x)
-        x = binary_sign_inference(x)
 
-        x = self.block2(x)
-        x = binary_sign_inference(x)
+def load_simplemlp_weights(model: SimpleMLP, weights_dir: Path, w1_file: str, w2_file: str) -> None:
+    """从 npy 文件加载 simplemlp 权重。
 
-        logits = self.classifier(x)
-        return logits
+    约定：
+    - w1 形状为 [784, 64]
+    - w2 形状为 [64, 10]
+    这与 x @ w 的右乘形式一致；赋值给 nn.Linear 时需要转置。
+    """
+    w1_path = (weights_dir / w1_file).resolve()
+    w2_path = (weights_dir / w2_file).resolve()
+
+    if not w1_path.exists() or not w2_path.exists():
+        raise FileNotFoundError(
+            "Weight file not found. "
+            f"w1: {w1_path.exists()} ({w1_path}), w2: {w2_path.exists()} ({w2_path})"
+        )
+
+    w1 = np.asarray(np.load(w1_path), dtype=np.float32)
+    w2 = np.asarray(np.load(w2_path), dtype=np.float32)
+
+    if w1.shape != (784, 64):
+        raise ValueError(f"Unexpected w1 shape: {w1.shape}, expected (784, 64)")
+    if w2.shape != (64, 10):
+        raise ValueError(f"Unexpected w2 shape: {w2.shape}, expected (64, 10)")
+
+    with torch.no_grad():
+        model.fc1.weight.copy_(torch.from_numpy(np.ascontiguousarray(w1.T)))
+        model.fc2.weight.copy_(torch.from_numpy(np.ascontiguousarray(w2.T)))
 
 
 def build_official_macs_profile(
     model: nn.Module,
     optical_layers: set[str],
 ) -> tuple[int, int, dict[str, int], dict[str, str]]:
-    """使用官方 MAC 统计代码构建本模型的计算量画像。
-
-    Returns:
-        total_macs_per_sample: 每个样本的总 MAC
-        optical_macs_per_sample: 选中光学层对应的每样本 MAC
-        macs_dict: 官方函数返回的逐算子 MAC 明细
-        layer_to_module_name: 逻辑层名到模块名映射
-    """
-    # 官方统计函数约束 batch=1。
+    """使用官方 MAC 统计代码构建本模型的计算量画像。"""
     dummy_input = torch.randn(1, 1, 28, 28)
     total_macs_per_sample, macs_dict = calculate_linear_macs(model, dummy_input)
 
-    # 逻辑层名与模型模块名映射。
     layer_to_module_name = {
-        "block1": "block1.0",
-        "block2": "block2.0",
-        "fc1": "classifier.1",
-        "fc2": "classifier.4",
+        "fc1": "fc1",
+        "fc2": "fc2",
     }
 
     missing_modules = [
@@ -308,10 +279,7 @@ def quantize_activation_for_optical(
 
     if input_type == "int4":
         # 某些 osimulator 版本在 inputType=int4 时可能触发负索引越界。
-        # 这里采用“偏移编码”规避：
-        # 1) 先量化到 q_signed in [-8, 7]
-        # 2) 再映射 q_uint = q_signed + 8，走稳定的 uint4 通路
-        # 3) 在输出端减去 zero_point * sum(w_q) 做等价还原
+        # 这里采用“偏移编码”规避，推理输出端会做对应还原。
         x_clip = torch.clamp(x_cpu, min=-clip_max, max=clip_max)
         scale = clip_max / 7.0
         q_signed = torch.round(x_clip / scale).clamp(-8, 7).to(torch.int32)
@@ -344,12 +312,7 @@ def run_optical_matmul(
     act_clip_max: float,
     timing_stats: dict[str, float],
 ) -> torch.Tensor:
-    """通过 osimulator 执行矩阵乘法并累计光学调用计时。
-
-    Expected shapes:
-    - a_bmk: [B, M, K]
-    - w_kn:  [K, N]
-    """
+    """通过 osimulator 执行矩阵乘法并累计光学调用计时。"""
     if a_bmk.ndim != 3:
         raise ValueError("a_bmk must be 3D with shape [B, M, K].")
     if w_kn.ndim != 2:
@@ -366,13 +329,11 @@ def run_optical_matmul(
     )
     w_q, w_scale = quantize_weight_to_int4_symmetric(w_kn)
 
-    # int4 偏移编码模式下，仅首次打印一次提示，避免日志刷屏。
     if input_type == "int4" and "int4_emulation_notice_printed" not in timing_stats:
         print("[Info] input_type=int4 is emulated via uint4 offset encoding for simulator compatibility.")
         timing_stats["int4_emulation_notice_printed"] = 1.0
 
-    # 将逐样本调用改为整批调用，可显著减少模拟器矩阵计算调用次数。
-    input_tensors = a_q.astype(np.int32, copy=False)  # [B, M, K]
+    input_tensors = a_q.astype(np.int32, copy=False)
     wght_tensors = np.broadcast_to(w_q[None, :, :], (bsz, w_q.shape[0], w_q.shape[1])).astype(np.int32, copy=True)
 
     call_start = time.perf_counter()
@@ -387,76 +348,16 @@ def run_optical_matmul(
     else:
         out_concat = np.asarray(result_model)
 
-    # 偏移编码还原：
-    # q_signed @ w = (q_uint - zp) @ w = q_uint @ w - zp * sum(w)
     if a_zero_point != 0:
-        w_sum = np.sum(w_q.astype(np.float32), axis=0, keepdims=True)  # [1, N]
+        w_sum = np.sum(w_q.astype(np.float32), axis=0, keepdims=True)
         out_concat = out_concat.astype(np.float32) - (float(a_zero_point) * w_sum[None, :, :])
 
     out_fp32 = out_concat.astype(np.float32) * (a_scale * w_scale)
     return torch.from_numpy(out_fp32)
 
 
-def conv2d_output_hw(
-    h: int,
-    w: int,
-    kernel_size: tuple[int, int],
-    stride: tuple[int, int],
-    padding: tuple[int, int],
-    dilation: tuple[int, int],
-) -> tuple[int, int]:
-    """计算 conv2d 输出空间尺寸。"""
-    out_h = (h + 2 * padding[0] - dilation[0] * (kernel_size[0] - 1) - 1) // stride[0] + 1
-    out_w = (w + 2 * padding[1] - dilation[1] * (kernel_size[1] - 1) - 1) // stride[1] + 1
-    return out_h, out_w
-
-
-def _as_pair(value: Any) -> tuple[int, int]:
-    """将 int 或 tuple 统一为二元组。"""
-    if isinstance(value, tuple):
-        return int(value[0]), int(value[1])
-    return int(value), int(value)
-
-
-def optical_conv2d_from_im2col(
-    optical_model: Any,
-    x: torch.Tensor,
-    conv: nn.Conv2d,
-    *,
-    input_type: str,
-    act_clip_max: float,
-    timing_stats: dict[str, float],
-) -> torch.Tensor:
-    """将 conv2d 重写为 im2col + 光学 matmul。"""
-    k = _as_pair(conv.kernel_size)
-    s = _as_pair(conv.stride)
-    p = _as_pair(conv.padding)
-    d = _as_pair(conv.dilation)
-
-    x_unfold = F.unfold(x, kernel_size=k, dilation=d, padding=p, stride=s)
-    x_bmk = x_unfold.transpose(1, 2).contiguous()
-
-    weight_kn = conv.weight.view(conv.out_channels, -1).transpose(0, 1).contiguous()
-    out_bmn = run_optical_matmul(
-        optical_model=optical_model,
-        a_bmk=x_bmk,
-        w_kn=weight_kn,
-        input_type=input_type,
-        act_clip_max=act_clip_max,
-        timing_stats=timing_stats,
-    )
-
-    bsz, _, h_in, w_in = x.shape
-    out_h, out_w = conv2d_output_hw(h_in, w_in, kernel_size=k, stride=s, padding=p, dilation=d)
-    out = out_bmn.transpose(1, 2).contiguous().view(bsz, conv.out_channels, out_h, out_w)
-
-    if conv.bias is not None:
-        out = out + conv.bias.detach().cpu().view(1, -1, 1, 1)
-    return out
-
-
 def forward_with_optical_matmul(
-    model: nn.Module,
+    model: SimpleMLP,
     images: torch.Tensor,
     optical_model: Any,
     *,
@@ -465,66 +366,12 @@ def forward_with_optical_matmul(
     timing_stats: dict[str, float],
     optical_layers: set[str],
 ) -> torch.Tensor:
-    """将 BNN 中矩阵乘法密集层替换为光学 matmul 前向。"""
-    # stem conv 保留 torch 侧执行。
-    stem_conv = model.stem[0]
-    stem_bn = model.stem[1]
+    """将 simplemlp 中选定线性层替换为光学 matmul 前向。"""
+    x = torch.flatten(images, start_dim=1)
 
-    x = F.conv2d(
-        images,
-        stem_conv.weight,
-        stem_conv.bias,
-        stride=stem_conv.stride,
-        padding=stem_conv.padding,
-        dilation=stem_conv.dilation,
-        groups=stem_conv.groups,
-    )
-    x = stem_bn(x)
-    x = F.hardtanh(x, inplace=False)
-    x = binary_sign_inference(x)
-
-    # block1 conv -> 光学 matmul。
-    block1_conv = model.block1[0]
-    block1_bn = model.block1[1]
-    if "block1" in optical_layers:
-        x = optical_conv2d_from_im2col(
-            optical_model=optical_model,
-            x=x,
-            conv=block1_conv,
-            input_type=input_type,
-            act_clip_max=act_clip_max,
-            timing_stats=timing_stats,
-        )
-    else:
-        x = block1_conv(x)
-    x = block1_bn(x)
-    x = F.max_pool2d(x, kernel_size=2)
-    x = binary_sign_inference(x)
-
-    # block2 conv -> 光学 matmul。
-    block2_conv = model.block2[0]
-    block2_bn = model.block2[1]
-    if "block2" in optical_layers:
-        x = optical_conv2d_from_im2col(
-            optical_model=optical_model,
-            x=x,
-            conv=block2_conv,
-            input_type=input_type,
-            act_clip_max=act_clip_max,
-            timing_stats=timing_stats,
-        )
-    else:
-        x = block2_conv(x)
-    x = block2_bn(x)
-    x = F.max_pool2d(x, kernel_size=2)
-    x = binary_sign_inference(x)
-
-    # fc1 -> 光学 matmul。
-    x = torch.flatten(x, start_dim=1)
-    fc1 = model.classifier[1]
     if "fc1" in optical_layers:
-        fc1_w_kn = fc1.weight.transpose(0, 1).contiguous()
-        fc1_out = run_optical_matmul(
+        fc1_w_kn = model.fc1.weight.transpose(0, 1).contiguous()
+        x = run_optical_matmul(
             optical_model=optical_model,
             a_bmk=x.unsqueeze(1),
             w_kn=fc1_w_kn,
@@ -532,18 +379,13 @@ def forward_with_optical_matmul(
             act_clip_max=act_clip_max,
             timing_stats=timing_stats,
         ).squeeze(1)
-        if fc1.bias is not None:
-            fc1_out = fc1_out + fc1.bias.detach().cpu()
     else:
-        fc1_out = fc1(x)
+        x = model.fc1(x)
 
-    fc1_bn = model.classifier[2]
-    x = fc1_bn(fc1_out)
+    x = F.relu(x, inplace=False)
 
-    # dropout 在 eval 模式下等价恒等映射。
-    fc2 = model.classifier[4]
     if "fc2" in optical_layers:
-        fc2_w_kn = fc2.weight.transpose(0, 1).contiguous()
+        fc2_w_kn = model.fc2.weight.transpose(0, 1).contiguous()
         logits = run_optical_matmul(
             optical_model=optical_model,
             a_bmk=x.unsqueeze(1),
@@ -552,9 +394,9 @@ def forward_with_optical_matmul(
             act_clip_max=act_clip_max,
             timing_stats=timing_stats,
         ).squeeze(1)
-        logits = logits + fc2.bias.detach().cpu()
     else:
-        logits = fc2(x)
+        logits = model.fc2(x)
+
     return logits
 
 
@@ -590,31 +432,9 @@ def build_test_loader(data_root: Path, batch_size: int, num_workers: int) -> Dat
     return loader
 
 
-def load_model_weights(model: nn.Module, checkpoint_path: Path) -> dict[str, Any]:
-    """加载 binary-state checkpoint 并返回元信息。"""
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-
-    metadata: dict[str, Any] = {}
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
-        metadata["epoch"] = checkpoint.get("epoch")
-        metadata["val_acc"] = checkpoint.get("val_acc")
-        metadata["pack_note"] = checkpoint.get("pack_note")
-    elif isinstance(checkpoint, dict):
-        state_dict = checkpoint
-    else:
-        raise TypeError("Unsupported checkpoint format. Expected dict.")
-
-    model.load_state_dict(state_dict)
-    return metadata
-
-
 @torch.no_grad()
 def evaluate(
-    model: nn.Module,
+    model: SimpleMLP,
     loader: DataLoader,
     optical_model: Any,
     *,
@@ -647,14 +467,12 @@ def evaluate(
     batch_forward_times: list[float] = []
 
     eval_start = time.perf_counter()
-
     evaluated_batches = 0
 
     for batch_idx, (images, labels) in enumerate(loader, start=1):
         if total_samples >= max_samples:
             break
 
-        # 光学后端是 CPU/Numpy 路径，因此输入固定走 CPU。
         images = images.to("cpu", non_blocking=True)
         labels = labels.to("cpu", non_blocking=True)
 
@@ -705,10 +523,8 @@ def evaluate(
             class_total[class_idx] += class_count
             class_correct[class_idx] += preds[class_mask].eq(labels[class_mask]).sum().item()
 
-        # 使用官方 MAC 口径进行占比累计，避免手写公式偏差。
-        bsz = labels.size(0)
-        optical_macs_total += optical_macs_per_sample * bsz
-        all_macs_total += total_macs_per_sample * bsz
+        optical_macs_total += optical_macs_per_sample * batch_size
+        all_macs_total += total_macs_per_sample * batch_size
 
     eval_end = time.perf_counter()
 
@@ -757,28 +573,22 @@ def evaluate(
     return avg_loss, overall_acc, per_class_acc, optical_ratio, timing_summary
 
 
-def resolve_path(project_root: Path, user_path: str) -> Path:
-    """Resolve user path to an absolute path using project root fallback."""
-    path = Path(user_path)
-    if path.is_absolute():
-        return path
-    return (project_root / path).resolve()
-
-
 def main() -> None:
     """程序入口。"""
+    overall_start = time.perf_counter()
+
     args = parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
+    weights_dir = resolve_path(project_root, args.weights_dir)
     data_root = resolve_path(project_root, args.data_root)
-    checkpoint_path = resolve_path(project_root, args.checkpoint)
     optical_layers = parse_optical_layers(args.optical_layers)
 
     device = select_device(args.device)
 
     print(f"Project root: {project_root}")
+    print(f"Weights dir: {weights_dir}")
     print(f"Data root: {data_root}")
-    print(f"Checkpoint: {checkpoint_path}")
     print(f"Using device for torch-side ops: {device}")
     print("Optical backend: osimulator (Gazelle model)")
     print(f"Optical offload layers: {sorted(optical_layers)}")
@@ -790,8 +600,8 @@ def main() -> None:
     )
 
     optical_model = load_optical_model()
-    model = MNISTBNN().to("cpu")
-    metadata = load_model_weights(model=model, checkpoint_path=checkpoint_path)
+    model = SimpleMLP().to("cpu")
+    load_simplemlp_weights(model=model, weights_dir=weights_dir, w1_file=args.w1_file, w2_file=args.w2_file)
 
     total_macs_per_sample, optical_macs_per_sample, macs_dict, layer_to_module_name = build_official_macs_profile(
         model=model,
@@ -804,13 +614,10 @@ def main() -> None:
     print(f"  optical_macs_per_sample: {optical_macs_per_sample:,}")
     print(f"  expected_optical_compute_ratio: {expected_optical_ratio:.4%}")
     print("  per-module macs:")
-    print(f"    stem.0: {macs_dict.get('stem.0', 0):,}")
-    print(f"    {layer_to_module_name['block1']}: {macs_dict[layer_to_module_name['block1']]:,}")
-    print(f"    {layer_to_module_name['block2']}: {macs_dict[layer_to_module_name['block2']]:,}")
     print(f"    {layer_to_module_name['fc1']}: {macs_dict[layer_to_module_name['fc1']]:,}")
     print(f"    {layer_to_module_name['fc2']}: {macs_dict[layer_to_module_name['fc2']]:,}")
 
-    expected_batches = (args.max_samples + args.batch_size - 1) // args.batch_size
+    expected_batches = math.ceil(args.max_samples / args.batch_size)
     expected_calls = expected_batches * len(optical_layers)
     print(f"Max samples: {args.max_samples}")
     print(f"Estimated optical calls: ~{expected_calls}")
@@ -828,13 +635,7 @@ def main() -> None:
         optical_macs_per_sample=optical_macs_per_sample,
     )
 
-    if metadata:
-        print("Checkpoint metadata:")
-        print(f"  epoch: {metadata.get('epoch')}")
-        print(f"  val_acc: {metadata.get('val_acc')}")
-        print(f"  pack_note: {metadata.get('pack_note')}")
-
-    print("\nEvaluation results on MNIST 10k test set:")
+    print("\nEvaluation results on MNIST test set:")
     print(f"  avg_loss: {avg_loss:.6f}")
     print(f"  top1_accuracy: {overall_acc:.4%}")
     print(f"  optical_compute_ratio: {optical_ratio:.4%}")
@@ -857,6 +658,9 @@ def main() -> None:
     print("\nPer-class accuracy:")
     for class_idx, acc in enumerate(per_class_acc):
         print(f"  class {class_idx}: {acc:.4%}")
+
+    overall_end = time.perf_counter()
+    print(f"\nTotal runtime (end-to-end): {overall_end - overall_start:.6f} s")
 
 
 if __name__ == "__main__":

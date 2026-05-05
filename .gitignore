@@ -35,3 +35,5 @@ docs/pythonProject4.zip
 #---tips：如果有特定的文件或目录需要保留，使用!来取消忽略，例如：
 # !important_file.txt
 #注意此规则要放在最后面，以确保它覆盖之前的忽略规则。
+.claude/worktrees/agent-a3e59c1a6c9893d63
+.claude/worktrees/agent-a1689a3cbc9564393

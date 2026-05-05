@@ -30,6 +30,8 @@ env/
 #---忽略data文件夹---
 data/
 docs/pythonProject4
+docs/pythonProject4.zip
+*.zip
 #---tips：如果有特定的文件或目录需要保留，使用!来取消忽略，例如：
 # !important_file.txt
 #注意此规则要放在最后面，以确保它覆盖之前的忽略规则。

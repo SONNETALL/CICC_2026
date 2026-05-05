@@ -80,15 +80,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-type",
         type=str,
-        default="int4",
-        choices=["int4", "uint4"],
+        default="uint8",
+        choices=["uint8"],
         help="Input type passed to osimulator model interface.",
     )
     parser.add_argument(
         "--act-clip-max",
         type=float,
-        default=4.0,
-        help="Global activation clip bound used as fallback for optical quantization.",
+        default=255.0,
+        help="Global activation clip bound used as fallback for uint8 optical quantization.",
     )
     parser.add_argument(
         "--act-clip-fc1",
@@ -111,7 +111,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--optical-layers",
         type=str,
-        default="fc1",
+        default="fc1,fc2,fc3",
         help=(
             "Comma-separated layers offloaded to optical simulator. "
             "Valid names: fc1,fc2,fc3. Example: --optical-layers fc1,fc2"
@@ -300,33 +300,25 @@ def quantize_activation_for_optical(
 
     x_cpu = x.detach().to(torch.float32).cpu()
 
-    if input_type == "uint4":
+    if input_type == "uint8":
         x_clip = torch.clamp(x_cpu, min=0.0, max=clip_max)
-        scale = clip_max / 15.0
-        q = torch.round(x_clip / scale).clamp(0, 15).to(torch.int32)
-        return q.numpy(), float(scale), 0, "uint4"
-
-    if input_type == "int4":
-        x_clip = torch.clamp(x_cpu, min=-clip_max, max=clip_max)
-        scale = clip_max / 7.0
-        q_signed = torch.round(x_clip / scale).clamp(-8, 7).to(torch.int32)
-        zero_point = 8
-        q_uint = q_signed + zero_point
-        return q_uint.numpy(), float(scale), zero_point, "uint4"
+        scale = clip_max / 255.0
+        q = torch.round(x_clip / scale).clamp(0, 255).to(torch.int32)
+        return q.numpy(), float(scale), 0, "uint8"
 
     raise ValueError(f"Unsupported input_type: {input_type}")
 
 
-def quantize_weight_to_int4_symmetric(w: torch.Tensor) -> tuple[np.ndarray, float]:
-    """将权重量化到对称 int4（[-8, 7]）。"""
+def quantize_weight_to_int8_symmetric(w: torch.Tensor) -> tuple[np.ndarray, float]:
+    """将权重量化到对称 int8（[-128, 127]）。"""
     w_cpu = w.detach().to(torch.float32).cpu()
     max_abs = torch.max(torch.abs(w_cpu)).item()
     if max_abs == 0.0:
         scale = 1.0
     else:
-        scale = max_abs / 7.0
+        scale = max_abs / 127.0
 
-    q = torch.round(w_cpu / scale).clamp(-8, 7).to(torch.int32)
+    q = torch.round(w_cpu / scale).clamp(-128, 127).to(torch.int32)
     return q.numpy(), float(scale)
 
 
@@ -354,11 +346,7 @@ def run_optical_matmul(
         input_type=input_type,
         clip_max=act_clip_max,
     )
-    w_q, w_scale = quantize_weight_to_int4_symmetric(w_kn)
-
-    if input_type == "int4" and "int4_emulation_notice_printed" not in timing_stats:
-        print("[Info] input_type=int4 is emulated via uint4 offset encoding for simulator compatibility.")
-        timing_stats["int4_emulation_notice_printed"] = 1.0
+    w_q, w_scale = quantize_weight_to_int8_symmetric(w_kn)
 
     input_tensors = a_q.astype(np.int32, copy=False)
     wght_tensors = np.broadcast_to(w_q[None, :, :], (bsz, w_q.shape[0], w_q.shape[1])).astype(np.int32, copy=True)
@@ -456,7 +444,6 @@ def build_test_loader(data_root: Path, batch_size: int, num_workers: int) -> Dat
     transform = transforms.Compose(
         [
             transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,)),
         ]
     )
 
@@ -522,7 +509,7 @@ def evaluate(
         if total_samples >= max_samples:
             break
 
-        images = images.to("cpu", non_blocking=True)
+        images = images.to("cpu", non_blocking=True) * 255.0
         labels = labels.to("cpu", non_blocking=True)
 
         remaining = max_samples - total_samples

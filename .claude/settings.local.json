@@ -7,7 +7,9 @@
       "Bash(docker exec 671358b4b89b *)",
       "Bash(docker cp *)",
       "Bash(docker exec sonn_lt_simulator *)",
-      "mcp__gptimage2__generate_image"
+      "mcp__gptimage2__generate_image",
+      "Read(//mnt/d/engin/CICC_2026/.claude/worktrees/**)",
+      "Read(//mnt/d/engin/CICC_2026/.claude/worktrees/agent-a3e59c1a6c9893d63/**)"
     ]
   }
 }

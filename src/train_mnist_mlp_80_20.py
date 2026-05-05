@@ -25,6 +25,7 @@ from pathlib import Path
 
 import torch
 from torch import nn, optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
@@ -65,25 +66,25 @@ def parse_args() -> argparse.Namespace:
         "--qat",
         action="store_true",
         default=False,
-        help="Enable fake-quantization during training to match optical int4 inference.",
+        help="Enable fake-quantization during training to match optical uint8 input / int8 weight inference.",
     )
     parser.add_argument(
         "--act-clip-fc1",
         type=float,
-        default=4.0,
-        help="Activation clip max for fc1 fake quant (ignored without --qat).",
+        default=255.0,
+        help="Activation clip max for fc1 uint8 fake quant (ignored without --qat).",
     )
     parser.add_argument(
         "--act-clip-fc2",
         type=float,
         default=0.0,
-        help="Activation clip max for fc2 fake quant. Default 0 = no fake quant for fc2 (matches optical default where only fc1 is offloaded).",
+        help="Activation clip max for fc2 uint8 fake quant. Default 0 = no fake quant for fc2.",
     )
     parser.add_argument(
         "--act-clip-fc3",
         type=float,
         default=0.0,
-        help="Activation clip max for fc3 fake quant. Default 0 = no fake quant for fc3.",
+        help="Activation clip max for fc3 uint8 fake quant. Default 0 = no fake quant for fc3.",
     )
 
     return parser.parse_args()
@@ -106,21 +107,25 @@ def select_device(device_arg: str) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def fake_quant_activation(x: torch.Tensor, clip_max: float) -> torch.Tensor:
-    """int4 对称伪量化, 前向量化/反量化, 反向用 STE 直传梯度.
+def _fake_quant_weight(w: torch.Tensor) -> torch.Tensor:
+    """int8 对称伪量化权重, 与光学路径 quantize_weight_to_int8_symmetric 一致."""
+    max_abs = w.abs().max().detach()
+    if max_abs == 0.0:
+        return w
+    scale = max_abs / 127.0
+    w_q = (w / scale).round().clamp(-128, 127)
+    w_deq = w_q * scale
+    return w + (w_deq - w).detach()
 
-    模拟光学推理路径的 int4 量化行为:
-        scale = clip_max / 7
-        q = round(clamp(x, -clip_max, clip_max) / scale).clamp(-8, 7)
-        x_deq = q * scale
-    """
+
+def _fake_quant_activation(x: torch.Tensor, clip_max: float) -> torch.Tensor:
+    """uint8 无符号伪量化激活, 与光学路径 quantize_activation_for_optical 一致."""
     if clip_max <= 0:
         return x
-    scale = clip_max / 7.0
-    x_clipped = x.clamp(-clip_max, clip_max)
-    x_q = (x_clipped / scale).round().clamp(-8, 7)
+    scale = clip_max / 255.0
+    x_clipped = x.clamp(0.0, clip_max)
+    x_q = (x_clipped / scale).round().clamp(0, 255)
     x_deq = x_q * scale
-    # STE: 前向取量化值, 反向梯度穿过 round
     return x + (x_deq - x).detach()
 
 
@@ -129,14 +134,17 @@ class MLP80x20(nn.Module):
 
     self.net 保持 nn.Sequential 不变，确保 state_dict 与旧 checkpoint
     及光学测试脚本中的索引访问（net.1 / net.4 / net.7）完全兼容。
-    QAT 仅在 forward 中手动穿插 fake_quant，不改变模块结构。
+    QAT 仅在 forward 中手动插入伪量化，不改变模块结构。
+
+    QAT 精确模拟光学推理路径：先量化输入激活为 uint8、权重量化为 int8，
+    再用浮点 F.linear（等价于 int matmul + 反量化）。
     """
 
     def __init__(
         self,
         dropout: float = 0.2,
         qat: bool = False,
-        act_clip_fc1: float = 4.0,
+        act_clip_fc1: float = 255.0,
         act_clip_fc2: float = 4.0,
         act_clip_fc3: float = 4.0,
     ) -> None:
@@ -162,20 +170,36 @@ class MLP80x20(nn.Module):
         if not self.qat:
             return self.net(x)
 
-        # QAT 路径：逐模块调用，在全连接后插入伪量化
+        # ── QAT 路径：模拟光学 uint8 输入 / int8 权重 matmul ──
         x = self.net[0](x)  # Flatten
-        x = self.net[1](x)  # fc1: Linear(784→80)
-        x = fake_quant_activation(x, self.act_clip_fc1)
+
+        # fc1: 量化输入激活 + 量化权重 → F.linear → bias → ReLU → Drop
+        fc1: nn.Linear = self.net[1]
+        x = _fake_quant_activation(x, self.act_clip_fc1)
+        w = _fake_quant_weight(fc1.weight)
+        x = F.linear(x, w, fc1.bias)
         x = self.net[2](x)  # ReLU
         x = self.net[3](x)  # Dropout
-        x = self.net[4](x)  # fc2: Linear(80→20)
+
+        # fc2: 同上模式（仅当 act_clip_fc2 > 0）
+        fc2: nn.Linear = self.net[4]
         if self.act_clip_fc2 > 0:
-            x = fake_quant_activation(x, self.act_clip_fc2)
+            x = _fake_quant_activation(x, self.act_clip_fc2)
+            w = _fake_quant_weight(fc2.weight)
+            x = F.linear(x, w, fc2.bias)
+        else:
+            x = fc2(x)
         x = self.net[5](x)  # ReLU
         x = self.net[6](x)  # Dropout
-        x = self.net[7](x)  # fc3: Linear(20→10)
+
+        # fc3: 输出层（通常不量化）
+        fc3: nn.Linear = self.net[7]
         if self.act_clip_fc3 > 0:
-            x = fake_quant_activation(x, self.act_clip_fc3)
+            x = _fake_quant_activation(x, self.act_clip_fc3)
+            w = _fake_quant_weight(fc3.weight)
+            x = F.linear(x, w, fc3.bias)
+        else:
+            x = fc3(x)
         return x
 
 
@@ -186,14 +210,12 @@ def build_dataloaders(data_root: Path, batch_size: int) -> tuple[DataLoader, Dat
             transforms.RandomAffine(degrees=8, translate=(0.1, 0.1)),
             transforms.ToTensor(),
             transforms.RandomErasing(p=0.5, scale=(0.02, 0.1)),
-            transforms.Normalize((0.1307,), (0.3081,)),
         ]
     )
 
     test_transform = transforms.Compose(
         [
             transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,)),
         ]
     )
 
@@ -237,7 +259,7 @@ def train_one_epoch(
     total_batches = len(loader)
 
     for batch_idx, (images, labels) in enumerate(loader, start=1):
-        images = images.to(device, non_blocking=True)
+        images = images.to(device, non_blocking=True) * 255.0
         labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad()
@@ -283,7 +305,7 @@ def evaluate(
     total = 0
 
     for images, labels in loader:
-        images = images.to(device, non_blocking=True)
+        images = images.to(device, non_blocking=True) * 255.0
         labels = labels.to(device, non_blocking=True)
 
         logits = model(images)
@@ -322,7 +344,7 @@ def main() -> None:
 
     if args.qat:
         print(
-            "QAT enabled — fake int4 quantization active during training. "
+            "QAT enabled — fake uint8 activation / int8 weight quantization active during training. "
             f"clip: fc1={args.act_clip_fc1}, fc2={args.act_clip_fc2}, fc3={args.act_clip_fc3}"
         )
     criterion = nn.CrossEntropyLoss()
@@ -368,6 +390,8 @@ def main() -> None:
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_acc": val_acc,
                     "args": vars(args),
+                    "input_format": "uint8_pixels",
+                    "optical_input_type": "uint8",
                     "qat_config": {
                         "qat": args.qat,
                         "act_clip_fc1": args.act_clip_fc1,

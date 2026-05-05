@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git *)",
+      "Bash(python *)",
+      "Bash(py *)",
+      "Bash(docker exec 671358b4b89b *)",
+      "Bash(docker cp *)",
+      "Bash(docker exec sonn_lt_simulator *)",
+      "mcp__gptimage2__generate_image"
+    ]
+  }
+}

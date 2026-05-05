@@ -153,5 +153,4 @@ if __name__ == "__main__":
     test_simpleNet()
     test_simpleNet2()
     test_resnet50()
- 
-    
+

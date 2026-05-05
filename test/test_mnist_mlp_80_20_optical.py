@@ -190,10 +190,22 @@ def select_device(device_arg: str) -> torch.device:
 
 
 class MLP80x20(nn.Module):
-    """MNIST 双隐藏层 MLP（80,20）带有 Dropout。"""
+    """MNIST 双隐藏层 MLP（80,20）带有 Dropout。
 
-    def __init__(self, dropout: float = 0.2) -> None:
+    构造函数签名与训练脚本保持兼容。推理时不启用 QAT——
+    光学路径通过 run_optical_matmul 独立处理量化。
+    """
+
+    def __init__(
+        self,
+        dropout: float = 0.2,
+        qat: bool = False,
+        act_clip_fc1: float = 4.0,
+        act_clip_fc2: float = 4.0,
+        act_clip_fc3: float = 4.0,
+    ) -> None:
         super().__init__()
+        _ = (qat, act_clip_fc1, act_clip_fc2, act_clip_fc3)
         self.net = nn.Sequential(
             nn.Flatten(),
             nn.Linear(28 * 28, 80),

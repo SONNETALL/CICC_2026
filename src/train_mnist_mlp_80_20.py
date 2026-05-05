@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a 2-hidden-layer MLP (80,20) on MNIST")
 
     # 训练轮次。
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=50)
 
     # mini-batch 大小。
     parser.add_argument("--batch-size", type=int, default=128)
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
 
     # Dropout
-    parser.add_argument("--dropout", type=float, default=0.15)
+    parser.add_argument("--dropout", type=float, default=0.10)
 
     # 权重衰减。
     parser.add_argument("--weight-decay", type=float, default=1e-5)
@@ -60,6 +60,32 @@ def parse_args() -> argparse.Namespace:
     # 每隔多少个 batch 打印一次训练指标。
     parser.add_argument("--log-interval", type=int, default=50)
 
+    # ── QAT (Quantization-Aware Training) ──
+    parser.add_argument(
+        "--qat",
+        action="store_true",
+        default=False,
+        help="Enable fake-quantization during training to match optical int4 inference.",
+    )
+    parser.add_argument(
+        "--act-clip-fc1",
+        type=float,
+        default=4.0,
+        help="Activation clip max for fc1 fake quant (ignored without --qat).",
+    )
+    parser.add_argument(
+        "--act-clip-fc2",
+        type=float,
+        default=0.0,
+        help="Activation clip max for fc2 fake quant. Default 0 = no fake quant for fc2 (matches optical default where only fc1 is offloaded).",
+    )
+    parser.add_argument(
+        "--act-clip-fc3",
+        type=float,
+        default=0.0,
+        help="Activation clip max for fc3 fake quant. Default 0 = no fake quant for fc3.",
+    )
+
     return parser.parse_args()
 
 
@@ -71,7 +97,6 @@ def set_seed(seed: int) -> None:
 
 
 def select_device(device_arg: str) -> torch.device:
-    """根据用户参数选择设备。"""
     if device_arg == "cpu":
         return torch.device("cpu")
     if device_arg == "cuda":
@@ -81,30 +106,91 @@ def select_device(device_arg: str) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class MLP80x20(nn.Module):
-    """MNIST 双隐藏层 MLP（80, 20）。"""
+def fake_quant_activation(x: torch.Tensor, clip_max: float) -> torch.Tensor:
+    """int4 对称伪量化, 前向量化/反量化, 反向用 STE 直传梯度.
 
-    def __init__(self, dropout: float = 0.2) -> None:
+    模拟光学推理路径的 int4 量化行为:
+        scale = clip_max / 7
+        q = round(clamp(x, -clip_max, clip_max) / scale).clamp(-8, 7)
+        x_deq = q * scale
+    """
+    if clip_max <= 0:
+        return x
+    scale = clip_max / 7.0
+    x_clipped = x.clamp(-clip_max, clip_max)
+    x_q = (x_clipped / scale).round().clamp(-8, 7)
+    x_deq = x_q * scale
+    # STE: 前向取量化值, 反向梯度穿过 round
+    return x + (x_deq - x).detach()
+
+
+class MLP80x20(nn.Module):
+    """MNIST 双隐藏层 MLP（80, 20），可选 QAT。
+
+    self.net 保持 nn.Sequential 不变，确保 state_dict 与旧 checkpoint
+    及光学测试脚本中的索引访问（net.1 / net.4 / net.7）完全兼容。
+    QAT 仅在 forward 中手动穿插 fake_quant，不改变模块结构。
+    """
+
+    def __init__(
+        self,
+        dropout: float = 0.2,
+        qat: bool = False,
+        act_clip_fc1: float = 4.0,
+        act_clip_fc2: float = 4.0,
+        act_clip_fc3: float = 4.0,
+    ) -> None:
         super().__init__()
 
+        self.qat = qat
+        self.act_clip_fc1 = act_clip_fc1
+        self.act_clip_fc2 = act_clip_fc2
+        self.act_clip_fc3 = act_clip_fc3
+
         self.net = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(28 * 28, 80),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout),
-            nn.Linear(80, 20),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout),
-            nn.Linear(20, 10),
+            nn.Flatten(),             # 0
+            nn.Linear(28 * 28, 80),  # 1  fc1
+            nn.ReLU(inplace=True),    # 2
+            nn.Dropout(p=dropout),    # 3
+            nn.Linear(80, 20),        # 4  fc2
+            nn.ReLU(inplace=True),    # 5
+            nn.Dropout(p=dropout),    # 6
+            nn.Linear(20, 10),        # 7  fc3
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        if not self.qat:
+            return self.net(x)
+
+        # QAT 路径：逐模块调用，在全连接后插入伪量化
+        x = self.net[0](x)  # Flatten
+        x = self.net[1](x)  # fc1: Linear(784→80)
+        x = fake_quant_activation(x, self.act_clip_fc1)
+        x = self.net[2](x)  # ReLU
+        x = self.net[3](x)  # Dropout
+        x = self.net[4](x)  # fc2: Linear(80→20)
+        if self.act_clip_fc2 > 0:
+            x = fake_quant_activation(x, self.act_clip_fc2)
+        x = self.net[5](x)  # ReLU
+        x = self.net[6](x)  # Dropout
+        x = self.net[7](x)  # fc3: Linear(20→10)
+        if self.act_clip_fc3 > 0:
+            x = fake_quant_activation(x, self.act_clip_fc3)
+        return x
 
 
 def build_dataloaders(data_root: Path, batch_size: int) -> tuple[DataLoader, DataLoader]:
     """构建 MNIST 的训练与测试数据加载器。"""
-    transform = transforms.Compose(
+    train_transform = transforms.Compose(
+        [
+            transforms.RandomAffine(degrees=8, translate=(0.1, 0.1)),
+            transforms.ToTensor(),
+            transforms.RandomErasing(p=0.5, scale=(0.02, 0.1)),
+            transforms.Normalize((0.1307,), (0.3081,)),
+        ]
+    )
+
+    test_transform = transforms.Compose(
         [
             transforms.ToTensor(),
             transforms.Normalize((0.1307,), (0.3081,)),
@@ -112,8 +198,8 @@ def build_dataloaders(data_root: Path, batch_size: int) -> tuple[DataLoader, Dat
     )
 
     # 使用本地数据，不自动下载，避免离线环境失败。
-    train_dataset = datasets.MNIST(root=str(data_root), train=True, transform=transform, download=False)
-    test_dataset = datasets.MNIST(root=str(data_root), train=False, transform=transform, download=False)
+    train_dataset = datasets.MNIST(root=str(data_root), train=True, transform=train_transform, download=False)
+    test_dataset = datasets.MNIST(root=str(data_root), train=False, transform=test_transform, download=False)
 
     train_loader = DataLoader(
         train_dataset,
@@ -226,9 +312,22 @@ def main() -> None:
 
     train_loader, test_loader = build_dataloaders(data_root=data_root, batch_size=args.batch_size)
 
-    model = MLP80x20(dropout=args.dropout).to(device)
+    model = MLP80x20(
+        dropout=args.dropout,
+        qat=args.qat,
+        act_clip_fc1=args.act_clip_fc1,
+        act_clip_fc2=args.act_clip_fc2,
+        act_clip_fc3=args.act_clip_fc3,
+    ).to(device)
+
+    if args.qat:
+        print(
+            "QAT enabled — fake int4 quantization active during training. "
+            f"clip: fc1={args.act_clip_fc1}, fc2={args.act_clip_fc2}, fc3={args.act_clip_fc3}"
+        )
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     best_acc = 0.0
     best_ckpt_path = output_dir / "best_mnist_mlp_80_20.pt"
@@ -252,6 +351,8 @@ def main() -> None:
             device=device,
         )
 
+        scheduler.step()
+
         print(
             f"Epoch {epoch:02d}/{args.epochs:02d} | "
             f"train_loss={train_loss:.4f}, train_acc={train_acc:.4f} | "
@@ -267,6 +368,12 @@ def main() -> None:
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_acc": val_acc,
                     "args": vars(args),
+                    "qat_config": {
+                        "qat": args.qat,
+                        "act_clip_fc1": args.act_clip_fc1,
+                        "act_clip_fc2": args.act_clip_fc2,
+                        "act_clip_fc3": args.act_clip_fc3,
+                    },
                 },
                 best_ckpt_path,
             )

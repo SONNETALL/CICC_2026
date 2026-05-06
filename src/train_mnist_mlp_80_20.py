@@ -219,7 +219,6 @@ def build_dataloaders(data_root: Path, batch_size: int) -> tuple[DataLoader, Dat
         ]
     )
 
-    # 使用本地数据，不自动下载，避免离线环境失败。
     train_dataset = datasets.MNIST(root=str(data_root), train=True, transform=train_transform, download=False)
     test_dataset = datasets.MNIST(root=str(data_root), train=False, transform=test_transform, download=False)
 

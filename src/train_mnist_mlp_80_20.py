@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128)
 
     # 学习率。
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=2e-3)
 
     # Dropout
     parser.add_argument("--dropout", type=float, default=0.10)
@@ -157,7 +157,7 @@ class MLP80x20(nn.Module):
 
         self.net = nn.Sequential(
             nn.Flatten(),             # 0
-            nn.Linear(28 * 28, 80),  # 1  fc1
+            nn.Linear(28 * 28, 80),   # 1  fc1
             nn.ReLU(inplace=True),    # 2
             nn.Dropout(p=dropout),    # 3
             nn.Linear(80, 20),        # 4  fc2
